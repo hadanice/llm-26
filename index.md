@@ -110,7 +110,7 @@ Use of AI coding assistants **is permitted**. However, you should explicitly att
 > In our first lecture, we introduce text preprocessing, including tokenization (BPE/WordPiece), and vocab design.
 > 
 > - Thu., 1:30 pm – 4:10 pm, 03/05/2026
-> - **Slides:** <a href="slides/lecture-01-slides/index.md" target="_blank" rel="noopener">Lecture 01 slides</a>
+> - **Slides:** <a href="slides/lecture-01-slides/index.html" target="_blank" rel="noopener">Lecture 01 slides</a>
 > - **Readings:**
 >   - <a href="papers/lecture-01-readings-0-JM_Book_Chapter_2.pdf" target="_blank" rel="noopener">JM Book Chapter 2</a>
 >   - <a href="papers/lecture-01-readings-1-Advances_in_NLP-2015.pdf" target="_blank" rel="noopener">Advances in NLP</a>
