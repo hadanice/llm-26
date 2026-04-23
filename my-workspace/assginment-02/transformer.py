@@ -1,47 +1,27 @@
 # transformer.py
 
+import math
 import time
+import random
+from types import SimpleNamespace
+from typing import List
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import random
+import torch.nn.functional as F
 from torch import optim
 import matplotlib.pyplot as plt
-from typing import List
+
 from utils import *
 
 
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-        # regularization
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
-        y = self.c_proj(y)
-        return y
-
-
+# -----------------------------------------------------------------------------
+# Reused MLP (kept exactly as provided in the template).
+# Pure nn.Linear + GELU -> fully compliant with the "no off-the-shelf
+# self-attention" rule.  We will plug this into our hand-written TransformerLayer
+# via a lightweight config object (SimpleNamespace(n_embd=d_model)).
+# -----------------------------------------------------------------------------
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -55,20 +35,6 @@ class MLP(nn.Module):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -90,7 +56,7 @@ class LetterCountingExample(object):
 # a single layer of the Transformer; this Module will take the raw words as input and do all of the steps necessary
 # to return distributions over the labels (0, 1, or 2).
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, num_positions, d_model, d_internal, num_classes, num_layers):
+    def __init__(self, vocab_size, num_positions, d_model, d_internal, num_classes, num_layers, causal: bool = True):
         """
         :param vocab_size: vocabulary size of the embedding layer
         :param num_positions: max sequence length that will be fed to the model; should be 20
@@ -98,41 +64,109 @@ class Transformer(nn.Module):
         :param d_internal: see TransformerLayer
         :param num_classes: number of classes predicted at the output layer; should be 3
         :param num_layers: number of TransformerLayers to use; can be whatever you want
+        :param causal: if True, each position only attends to previous positions (BEFORE task).
+                        If False, each position attends to all positions (BEFOREAFTER task).
         """
         super().__init__()
-        raise Exception("Implement me")
+        self.vocab_size = vocab_size
+        self.num_positions = num_positions
+        self.d_model = d_model
+        self.num_classes = num_classes
+        self.causal = causal
+
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_enc = PositionalEncoding(d_model, num_positions=num_positions, batched=False)
+
+        self.layers = nn.ModuleList([
+            TransformerLayer(d_model, d_internal, causal=causal)
+            for _ in range(num_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, num_classes)
 
     def forward(self, indices):
         """
 
-        :param indices: list of input indices
-        :return: A tuple of the softmax log probabilities (should be a 20x3 matrix) and a list of the attention
-        maps you use in your layers (can be variable length, but each should be a 20x20 matrix)
+        :param indices: LongTensor of shape [seq_len] (non-batched, required by decode())
+                        OR [batch, seq_len] (used internally for faster training)
+        :return: A tuple of the softmax log probabilities and a list of attention maps.
+                Shapes follow the input: [seq_len, num_classes] / [seq_len, seq_len] for 1D input,
+                or [batch, seq_len, num_classes] / [batch, seq_len, seq_len] for 2D input.
         """
-        raise Exception("Implement me")
+        if indices.dim() not in (1, 2):
+            raise ValueError("forward() expects a 1D or 2D LongTensor; got shape %s" % str(indices.shape))
+
+        x = self.tok_emb(indices)
+        x = self.pos_enc(x)
+
+        attn_maps = []
+        for layer in self.layers:
+            x, attn = layer(x)
+            attn_maps.append(attn)
+
+        x = self.ln_f(x)
+        logits = self.head(x)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return log_probs, attn_maps
 
 
 # Your implementation of the Transformer layer goes here. It should take vectors and return the same number of vectors
 # of the same length, applying self-attention, the feedforward layer, etc.
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, d_internal):
+    def __init__(self, d_model, d_internal, causal: bool = True):
         """
         :param d_model: The dimension of the inputs and outputs of the layer (note that the inputs and outputs
         have to be the same size for the residual connection to work)
         :param d_internal: The "internal" dimension used in the self-attention computation. Your keys and queries
         should both be of this length.
+        :param causal: whether to apply a causal (upper-triangular) attention mask.
         """
         super().__init__()
-        raise Exception("Implement me")
+        self.d_model = d_model
+        self.d_internal = d_internal
+        self.causal = causal
+
+        self.W_q = nn.Linear(d_model, d_internal)
+        self.W_k = nn.Linear(d_model, d_internal)
+        self.W_v = nn.Linear(d_model, d_internal)
+        self.W_o = nn.Linear(d_internal, d_model)
+
+        self.ln_1 = nn.LayerNorm(d_model)
+        self.ln_2 = nn.LayerNorm(d_model)
+
+        self.mlp = MLP(SimpleNamespace(n_embd=d_model))
 
     def forward(self, input_vecs):
         """
-        :param input_vecs: an input tensor of shape [seq len, d_model]
+        :param input_vecs: tensor of shape [seq len, d_model] OR [batch, seq len, d_model]
         :return: a tuple of two elements:
-            - a tensor of shape [seq len, d_model] representing the log probabilities of each position in the input
-            - a tensor of shape [seq len, seq len], representing the attention map for this layer
+            - output tensor of the same shape as input_vecs
+            - attention map: shape [seq len, seq len] if input is 2D, or [batch, seq len, seq len] if 3D
         """
-        raise Exception("Implement me")
+        x = input_vecs
+        T = x.shape[-2]
+
+        h = self.ln_1(x)
+        q = self.W_q(h)
+        k = self.W_k(h)
+        v = self.W_v(h)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_internal)
+
+        if self.causal:
+            mask = torch.triu(torch.ones(T, T, device=scores.device), diagonal=1).bool()
+            scores = scores.masked_fill(mask, float('-inf'))
+
+        attn = torch.softmax(scores, dim=-1)
+
+        ctx = torch.matmul(attn, v)
+        attn_out = self.W_o(ctx)
+
+        x = x + attn_out
+        x = x + self.mlp(self.ln_2(x))
+
+        return x, attn
 
 
 # Implementation of positional encoding that you can use in your network
@@ -170,29 +204,85 @@ class PositionalEncoding(nn.Module):
 
 # This is a skeleton for train_classifier: you can implement this however you want
 def train_classifier(args, train, dev):
-    raise Exception("Not fully implemented yet")
+    import os
 
-    # The following code DOES NOT WORK but can be a starting point for your implementation
-    # Some suggested snippets to use:
-    model = Transformer(...)
-    model.zero_grad()
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    causal = (args.task == "BEFORE")
+    os.makedirs("plots", exist_ok=True)
 
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+
+    vocab_size = 27
+    num_positions = 20
+    d_model = 64
+    d_internal = 64
+    num_classes = 3
+    num_layers = 2
+
+    model = Transformer(
+        vocab_size=vocab_size,
+        num_positions=num_positions,
+        d_model=d_model,
+        d_internal=d_internal,
+        num_classes=num_classes,
+        num_layers=num_layers,
+        causal=causal,
+    )
+    print("Model architecture:")
+    print(model)
+    print("Task: %s  |  causal=%s" % (args.task, causal))
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    loss_fcn = nn.NLLLoss()
+
+    train_inputs = torch.stack([ex.input_tensor for ex in train], dim=0)
+    train_labels = torch.stack([ex.output_tensor for ex in train], dim=0)
+
+    batch_size = 64
     num_epochs = 10
-    for t in range(0, num_epochs):
+    for t in range(num_epochs):
+        model.train()
+        epoch_start = time.time()
         loss_this_epoch = 0.0
-        random.seed(t)
-        # You can use batching if you'd like
-        ex_idxs = [i for i in range(0, len(train))]
-        random.shuffle(ex_idxs)
-        loss_fcn = nn.NLLLoss()
-        for ex_idx in ex_idxs:
-            loss = loss_fcn(...) # TODO: Run forward and compute loss
-            # model.zero_grad()
-            # loss.backward()
-            # optimizer.step()
+        num_batches = 0
+
+        torch.manual_seed(t)
+        perm = torch.randperm(len(train))
+
+        for start in range(0, len(train), batch_size):
+            idx = perm[start:start + batch_size]
+            x_batch = train_inputs[idx]
+            y_batch = train_labels[idx]
+
+            log_probs, _ = model.forward(x_batch)
+            B, T, C = log_probs.shape
+            loss = loss_fcn(log_probs.reshape(B * T, C), y_batch.reshape(B * T))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
             loss_this_epoch += loss.item()
+            num_batches += 1
+
+        avg_loss = loss_this_epoch / max(num_batches, 1)
+
+        model.eval()
+        with torch.no_grad():
+            num_correct = 0
+            num_total = 0
+            dev_subset = dev[:200]
+            for ex in dev_subset:
+                log_probs, _ = model.forward(ex.input_tensor)
+                preds = log_probs.argmax(dim=-1).numpy()
+                num_correct += int((preds == ex.output).sum())
+                num_total += len(preds)
+            dev_acc = num_correct / num_total
+
+        print("Epoch %2d | train_loss=%.4f | dev_acc(200 exs)=%.4f | time=%.1fs"
+              % (t + 1, avg_loss, dev_acc, time.time() - epoch_start), flush=True)
+
     model.eval()
     return model
 
